@@ -1,0 +1,358 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Transit Gateway 1:1 NAT verification. VPC-A (Windows Server 2025) reaches the
+  Apache web servers in VPC-B through NAT addresses (100.64.0.0/24 and 100.64.1.0/24).
+
+Parameters:
+  WindowsInstanceType:
+    Type: String
+    Default: t8i.medium
+  WebInstanceType:
+    Type: String
+    Default: t8i.micro
+  WindowsAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base
+  LinuxAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  VpcANatCidr:
+    Type: String
+    Default: 100.64.0.0/24
+    Description: NAT CIDR of VPC-A. Same prefix length as the VPC CIDR.
+  VpcBNatCidr:
+    Type: String
+    Default: 100.64.1.0/24
+    Description: NAT CIDR of VPC-B. Same prefix length as the VPC CIDR.
+
+Resources:
+  KeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub ${AWS::StackName}-keypair
+      KeyType: rsa
+      KeyFormat: pem
+
+  # ---------------------------------------------------------------- Transit Gateway
+  TransitGateway:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      Description: tgw-1to1-nat
+      DefaultRouteTableAssociation: enable
+      DefaultRouteTablePropagation: enable
+      Tags:
+        - Key: Name
+          Value: tgw-1to1-nat
+
+  # ---------------------------------------------------------------- VPC-A
+  VpcA:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 192.168.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: vpc-a
+
+  # The instance IP (192.168.0.10) is outside 192.168.0.128/25, so the single subnet is 192.168.0.0/25.
+  VpcASubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcA
+      CidrBlock: 192.168.0.0/25
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: vpc-a-subnet
+
+  VpcARouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcA
+      Tags:
+        - Key: Name
+          Value: vpc-a-rt
+
+  VpcARtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref VpcASubnet
+      RouteTableId: !Ref VpcARouteTable
+
+  VpcAAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref VpcA
+      SubnetIds:
+        - !Ref VpcASubnet
+      Tags:
+        - Key: Name
+          Value: tgw-attach-vpc-a
+
+  VpcANatConfiguration:
+    Type: AWS::EC2::TransitGatewayAttachmentNatConfiguration
+    Properties:
+      TransitGatewayAttachmentId: !Ref VpcAAttachment
+      NatGatewaySupport: enable
+      NatGatewayRules:
+        - RuleNumber: 100
+          MatchSourceCidr: 192.168.0.0/24
+          NatCidr: !Ref VpcANatCidr
+
+  # Route to VPC-B's NAT CIDR
+  VpcARouteToVpcBNat:
+    Type: AWS::EC2::Route
+    DependsOn: VpcAAttachment
+    Properties:
+      RouteTableId: !Ref VpcARouteTable
+      DestinationCidrBlock: !Ref VpcBNatCidr
+      TransitGatewayId: !Ref TransitGateway
+
+  EiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 Instance Connect Endpoint (egress to the Windows instance only)
+      VpcId: !Ref VpcA
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: 192.168.0.0/24
+      Tags:
+        - Key: Name
+          Value: vpc-a-eice-sg
+
+  WindowsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Windows instance A (RDP from EICE only)
+      VpcId: !Ref VpcA
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          SourceSecurityGroupId: !Ref EiceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: vpc-a-windows-sg
+
+  InstanceConnectEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Properties:
+      SubnetId: !Ref VpcASubnet
+      SecurityGroupIds:
+        - !Ref EiceSecurityGroup
+      PreserveClientIp: false
+      Tags:
+        - Key: Name
+          Value: vpc-a-eice
+
+  WindowsInstanceA:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref WindowsAmiId
+      InstanceType: !Ref WindowsInstanceType
+      KeyName: !Ref KeyPair
+      CreditSpecification:
+        CPUCredits: standard
+      SubnetId: !Ref VpcASubnet
+      PrivateIpAddress: 192.168.0.10
+      SecurityGroupIds:
+        - !Ref WindowsSecurityGroup
+      Tags:
+        - Key: Name
+          Value: instance-a-windows
+
+  # ---------------------------------------------------------------- VPC-B
+  VpcB:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 192.168.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: vpc-b
+
+  # Same CIDR as VPC-A on purpose (overlapping). Single subnet 192.168.0.0/25.
+  VpcBSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcB
+      CidrBlock: 192.168.0.0/25
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: vpc-b-subnet
+
+  VpcBRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcB
+      Tags:
+        - Key: Name
+          Value: vpc-b-rt
+
+  VpcBRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref VpcBSubnet
+      RouteTableId: !Ref VpcBRouteTable
+
+  # Amazon Linux 2023 package repositories are served from S3, so dnf works without internet access.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcB
+      VpcEndpointType: Gateway
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      RouteTableIds:
+        - !Ref VpcBRouteTable
+
+  VpcBAttachment:
+    Type: AWS::EC2::TransitGatewayVpcAttachment
+    Properties:
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref VpcB
+      SubnetIds:
+        - !Ref VpcBSubnet
+      Tags:
+        - Key: Name
+          Value: tgw-attach-vpc-b
+
+  VpcBNatConfiguration:
+    Type: AWS::EC2::TransitGatewayAttachmentNatConfiguration
+    Properties:
+      TransitGatewayAttachmentId: !Ref VpcBAttachment
+      NatGatewaySupport: enable
+      NatGatewayRules:
+        - RuleNumber: 100
+          MatchSourceCidr: 192.168.0.0/24
+          NatCidr: !Ref VpcBNatCidr
+
+  # Return route to VPC-A's NAT CIDR
+  VpcBRouteToVpcANat:
+    Type: AWS::EC2::Route
+    DependsOn: VpcBAttachment
+    Properties:
+      RouteTableId: !Ref VpcBRouteTable
+      DestinationCidrBlock: !Ref VpcANatCidr
+      TransitGatewayId: !Ref TransitGateway
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web servers (HTTP and ICMP from the VPC-A NAT CIDR)
+      VpcId: !Ref VpcB
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref VpcANatCidr
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !Ref VpcANatCidr
+      Tags:
+        - Key: Name
+          Value: vpc-b-web-sg
+
+  WebServerA:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - S3GatewayEndpoint
+      - VpcBRtAssoc
+    Properties:
+      ImageId: !Ref LinuxAmiId
+      InstanceType: !Ref WebInstanceType
+      CreditSpecification:
+        CPUCredits: standard
+      SubnetId: !Ref VpcBSubnet
+      PrivateIpAddress: 192.168.0.5
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+      Tags:
+        - Key: Name
+          Value: instance-b-web-server-a
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -x
+          dnf install -y httpd
+          cat > /etc/httpd/conf.d/ssi.conf <<'EOF'
+          <Directory "/var/www/html">
+            Options +Includes
+            AddType text/html .html
+            AddOutputFilter INCLUDES .html
+          </Directory>
+          EOF
+          cat > /var/www/html/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html><head><meta charset="UTF-8"><title>Web Server A</title></head>
+          <body>
+          <p>Web Server A - 192.168.0.5</p>
+          <p>Your IP address is：<!--#echo var="REMOTE_ADDR" --></p>
+          </body></html>
+          EOF
+          systemctl enable --now httpd
+
+  WebServerB:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - S3GatewayEndpoint
+      - VpcBRtAssoc
+    Properties:
+      ImageId: !Ref LinuxAmiId
+      InstanceType: !Ref WebInstanceType
+      CreditSpecification:
+        CPUCredits: standard
+      SubnetId: !Ref VpcBSubnet
+      PrivateIpAddress: 192.168.0.10
+      SecurityGroupIds:
+        - !Ref WebSecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+      Tags:
+        - Key: Name
+          Value: instance-b-web-server-b
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -x
+          dnf install -y httpd
+          cat > /etc/httpd/conf.d/ssi.conf <<'EOF'
+          <Directory "/var/www/html">
+            Options +Includes
+            AddType text/html .html
+            AddOutputFilter INCLUDES .html
+          </Directory>
+          EOF
+          cat > /var/www/html/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html><head><meta charset="UTF-8"><title>Web Server B</title></head>
+          <body>
+          <p>Web Server B - 192.168.0.10</p>
+          <p>Your IP address is：<!--#echo var="REMOTE_ADDR" --></p>
+          </body></html>
+          EOF
+          systemctl enable --now httpd
+
+Outputs:
+  KeyPairId:
+    Description: Private key is stored in SSM Parameter Store at /ec2/keypair/<KeyPairId>
+    Value: !GetAtt KeyPair.KeyPairId
+  WindowsInstanceId:
+    Value: !Ref WindowsInstanceA
+  InstanceConnectEndpointId:
+    Value: !GetAtt InstanceConnectEndpoint.Id
+  RdpTunnelCommand:
+    Description: Open an RDP tunnel through EICE, then connect with an RDP client to localhost:13389
+    Value: !Sub aws ec2-instance-connect open-tunnel --instance-connect-endpoint-id ${InstanceConnectEndpoint.Id} --private-ip-address 192.168.0.10 --remote-port 3389 --local-port 13389
+  WebServerAUrlFromVpcA:
+    Value: http://100.64.1.5/
+  WebServerBUrlFromVpcA:
+    Value: http://100.64.1.10/
